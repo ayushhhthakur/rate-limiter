@@ -247,7 +247,7 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
   const { url, method = 'GET' } = req.body;
   const clientIP = getClientIP(req);
   const clientIPInfo = await fetchIPInfo(clientIP);
-  cumulativeCounts.url++; // increment cumulative URL counter
+  cumulativeCounts.url++;
   lastClientForURL.set(url, { clientIP, clientIPInfo, lastAt: Date.now() });
   
   try {
@@ -280,24 +280,21 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
     if (rateLimitInfo.limit && rateLimitInfo.window) {
       urlRateLimiter.setCustomLimits(url, rateLimitInfo.limit, rateLimitInfo.window * 1000);
     } else {
-      // Default limits if none detected - more conservative for unknown APIs
       urlRateLimiter.setCustomLimits(url, 60, 3600000); // 60 requests per hour as default
     }
     
-    // Now check the rate limit after setting it
-    const limitResult = urlRateLimiter.checkLimit(url);
+    // DON'T call checkLimit again here - it was already called in middleware
+    // const limitResult = urlRateLimiter.checkLimit(url); // Remove this line
     
-    // Try to get response body for additional info
-    let responseData = null;
-    try {
-      const contentType = response.headers.get('content-type');
-      if (contentType && contentType.includes('application/json')) {
-        responseData = await response.json();
-      }
-    } catch {}
-    return res.json({
-      message: limitResult.allowed ? 'URL request successful!' : 'Rate limit detected and applied',
-      url,
+    // Get current status without incrementing
+    const currentStatus = urlRateLimiter.storage.get(url) || { requests: [] };
+    const currentRequests = currentStatus.requests.filter(timestamp => 
+      Date.now() - timestamp < (rateLimitInfo.window * 1000 || 3600000)
+    ).length;
+    
+    res.json({
+      message: 'URL request successful!',
+      url: url,
       method: method.toUpperCase(),
       clientIP,
       clientIPInfo,
@@ -308,30 +305,33 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
         detected: rateLimitInfo,
         applied: {
           limit: rateLimitInfo.limit || 60,
-            window: rateLimitInfo.window || 3600,
-            remaining: rateLimitInfo.remaining,
-            resetTime: rateLimitInfo.resetTime
+          window: rateLimitInfo.window || 3600,
+          remaining: rateLimitInfo.remaining,
+          resetTime: rateLimitInfo.resetTime
         }
       },
       currentUsage: {
-        requestCount: limitResult.currentRequests,
-        allowed: limitResult.allowed
+        requestCount: currentRequests,
+        allowed: true
       },
       responseHeaders: Object.fromEntries(
-        Array.from(response.headers.entries()).filter(([key]) =>
-          key.toLowerCase().includes('ratelimit') ||
-          key.toLowerCase().includes('rate-limit') ||
+        Array.from(response.headers.entries()).filter(([key]) => 
+          key.toLowerCase().includes('ratelimit') || 
+          key.toLowerCase().includes('rate-limit') || 
           key.toLowerCase().includes('retry-after') ||
           key.toLowerCase().includes('x-ratelimit')
         )
       )
     });
   } catch (error) {
-    urlRateLimiter.setCustomLimits(url, 60, 3600000);
-    const limitResult = urlRateLimiter.checkLimit(url);
-    return res.json({
+    // ...existing error handling...
+    // DON'T call checkLimit here either
+    const currentStatus = urlRateLimiter.storage.get(url) || { requests: [] };
+    const currentRequests = currentStatus.requests.length;
+    
+    res.json({
       message: 'Rate limit test completed (URL may be unreachable)',
-      url,
+      url: url,
       method: method.toUpperCase(),
       clientIP,
       clientIPInfo,
@@ -342,8 +342,8 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
         applied: { limit: 60, window: 3600 }
       },
       currentUsage: {
-        requestCount: limitResult.currentRequests,
-        allowed: limitResult.allowed
+        requestCount: currentRequests,
+        allowed: true
       }
     });
   }
@@ -353,11 +353,10 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
   const { url, method = 'GET', limit = 10, window = 60 } = req.body;
   const clientIP = getClientIP(req);
   const clientIPInfo = await fetchIPInfo(clientIP);
-  cumulativeCounts.custom++; // increment cumulative custom counter
+  cumulativeCounts.custom++;
   lastClientForCustom.set(url, { clientIP, clientIPInfo, lastAt: Date.now() });
   
   try {
-    // Make actual request to the URL
     const startTime = Date.now();
     
     const fetchOptions = {
@@ -367,10 +366,9 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9'
       },
-      timeout: 10000 // 10 second timeout
+      timeout: 10000
     };
 
-    // Add body for POST/PUT/PATCH methods
     if (['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
       fetchOptions.headers['Content-Type'] = 'application/json';
       fetchOptions.body = JSON.stringify({ 
@@ -383,12 +381,54 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
     const response = await fetch(url, fetchOptions);
     const responseTime = Date.now() - startTime;
     
-    // Now check the rate limit after making the request
-    const limitResult = customRateLimiter.checkLimit(url);
+    // Check if we got a rate limit response (429)
+    if (response.status === 429) {
+      const rateLimitInfo = extractRateLimitFromHeaders(response.headers, response.status);
+      
+      if (rateLimitInfo.limit && rateLimitInfo.window) {
+        customRateLimiter.setCustomLimits(url, rateLimitInfo.limit, rateLimitInfo.window * 1000);
+        
+        // Get current status without incrementing again
+        const currentStatus = customRateLimiter.storage.get(url) || { requests: [] };
+        const currentRequests = currentStatus.requests.length;
+        
+        return res.status(429).json({
+          error: 'Too Many Requests',
+          message: `Rate limit detected from server: ${rateLimitInfo.limit} requests/${rateLimitInfo.window}s`,
+          url: url,
+          method: method.toUpperCase(),
+          clientIP,
+          clientIPInfo,
+          timestamp: new Date().toISOString(),
+          responseStatus: response.status,
+          responseTime: `${responseTime}ms`,
+          detectedLimits: rateLimitInfo,
+          customLimits: {
+            configured: { limit: parseInt(limit), window: parseInt(window) },
+            detected: { limit: rateLimitInfo.limit, window: rateLimitInfo.window },
+            actual: { limit: rateLimitInfo.limit, window: rateLimitInfo.window },
+            current: currentRequests,
+            remaining: rateLimitInfo.limit - currentRequests
+          },
+          currentUsage: {
+            requestCount: currentRequests,
+            allowed: false
+          },
+          note: 'Server returned 429 - actual limits detected and applied'
+        });
+      }
+    }
     
-    return res.json({
+    // DON'T call checkLimit again here - it was already called in middleware
+    // Get current status without incrementing
+    const currentStatus = customRateLimiter.storage.get(url) || { requests: [] };
+    const currentRequests = currentStatus.requests.filter(timestamp => 
+      Date.now() - timestamp < (parseInt(window) * 1000)
+    ).length;
+    
+    res.json({
       message: 'Custom endpoint test successful!',
-      url,
+      url: url,
       method: method.toUpperCase(),
       clientIP,
       clientIPInfo,
@@ -398,19 +438,22 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
       customLimits: {
         limit: parseInt(limit),
         window: parseInt(window),
-        current: limitResult.currentRequests,
-        remaining: parseInt(limit) - limitResult.currentRequests
+        current: currentRequests,
+        remaining: parseInt(limit) - currentRequests
       },
       currentUsage: {
-        requestCount: limitResult.currentRequests,
-        allowed: limitResult.allowed
+        requestCount: currentRequests,
+        allowed: true
       }
     });
   } catch (error) {
-    const limitResult = customRateLimiter.checkLimit(url);
-    return res.json({
+    // ...existing error handling without calling checkLimit again...
+    const currentStatus = customRateLimiter.storage.get(url) || { requests: [] };
+    const currentRequests = currentStatus.requests.length;
+    
+    res.json({
       message: 'Custom endpoint test completed (URL may be unreachable)',
-      url,
+      url: url,
       method: method.toUpperCase(),
       clientIP,
       clientIPInfo,
@@ -419,12 +462,12 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
       customLimits: {
         limit: parseInt(limit),
         window: parseInt(window),
-        current: limitResult.currentRequests,
-        remaining: parseInt(limit) - limitResult.currentRequests
+        current: currentRequests,
+        remaining: parseInt(limit) - currentRequests
       },
       currentUsage: {
-        requestCount: limitResult.currentRequests,
-        allowed: limitResult.allowed
+        requestCount: currentRequests,
+        allowed: true
       }
     });
   }

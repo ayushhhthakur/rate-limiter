@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Header from './components/Header';
 import Notifications from './components/Notifications';
 import StatsDashboard from './components/StatsDashboard';
@@ -34,6 +34,18 @@ function App() {
   const [notifications, setNotifications] = useState([]);
   const [analytics, setAnalytics] = useState(null);
 
+  // Add custom flood testing state
+  const [isCustomFloodTesting, setIsCustomFloodTesting] = useState(false);
+  const [customFloodResults, setCustomFloodResults] = useState(null);
+
+  // Add cancel state for flood tests
+  const [cancelFloodTest, setCancelFloodTest] = useState(false);
+  const [cancelCustomFloodTest, setCancelCustomFloodTest] = useState(false);
+
+  // Use refs for cancel flags to ensure immediate access
+  const cancelFloodTestRef = useRef(false);
+  const cancelCustomFloodTestRef = useRef(false);
+
   // Get current URL status for button state
   const getCurrentUrlStatus = () => {
     if (!testUrl) return { canRequest: false, reason: 'URL required' };
@@ -50,6 +62,31 @@ function App() {
     }
     
     if (urlInfo.requestCount >= urlInfo.limits?.maxRequests) {
+      return { 
+        canRequest: false, 
+        reason: 'Rate limit reached' 
+      };
+    }
+    
+    return { canRequest: true, reason: '' };
+  };
+
+  // Get current custom endpoint status
+  const getCurrentCustomStatus = () => {
+    if (!customEndpoint) return { canRequest: false, reason: 'Endpoint required' };
+    
+    const endpointInfo = customData.find(item => item.url === customEndpoint);
+    
+    if (!endpointInfo) return { canRequest: true, reason: '' };
+    
+    if (endpointInfo.status === 'Blocked') {
+      return { 
+        canRequest: false, 
+        reason: `Blocked for ${endpointInfo.timeLeft}s` 
+      };
+    }
+    
+    if (endpointInfo.requestCount >= endpointInfo.limits?.maxRequests) {
       return { 
         canRequest: false, 
         reason: 'Rate limit reached' 
@@ -229,6 +266,7 @@ function App() {
     if (!testUrl) return;
     
     setIsFloodTesting(true);
+    cancelFloodTestRef.current = false;
     setUrlMessage('');
     setFloodResults(null);
     
@@ -237,20 +275,23 @@ function App() {
       successfulRequests: 0,
       rateLimitHit: false,
       rateLimitAt: null,
+      errorAt: null,
+      errorStatus: null,
       responses: [],
       startTime: Date.now(),
       endTime: null,
       detectedLimits: null,
-      errors: []
+      errors: [],
+      cancelled: false
     };
 
     try {
       let requestCount = 0;
-      let rateLimitHit = false;
-      const maxRequests = 100; // Safety limit
-      const requestDelay = 100; // 100ms between requests
+      let stopTesting = false;
+      const maxRequests = 100;
+      const requestDelay = 100;
 
-      while (!rateLimitHit && requestCount < maxRequests) {
+      while (!stopTesting && requestCount < maxRequests && !cancelFloodTestRef.current) {
         requestCount++;
         results.totalRequests = requestCount;
 
@@ -280,32 +321,33 @@ function App() {
 
           results.responses.push(responseLog);
 
-          if (response.status === 429) {
-            rateLimitHit = true;
-            results.rateLimitHit = true;
-            results.rateLimitAt = requestCount;
-            results.detectedLimits = data.rateLimitInfo?.detected;
+          // Check for 4xx or 5xx responses
+          if (response.status >= 400) {
+            stopTesting = true;
+            results.errorAt = requestCount;
+            results.errorStatus = response.status;
             
-            setUrlMessage(`🚫 Rate limit hit! Got 429 after ${requestCount} requests`);
+            if (response.status === 429) {
+              results.rateLimitHit = true;
+              results.rateLimitAt = requestCount;
+              results.detectedLimits = data.rateLimitInfo?.detected;
+              setUrlMessage(`🚫 Rate limit hit! Got 429 after ${requestCount} requests`);
+              addNotification(`Rate limit reached at request #${requestCount}`, 'error');
+            } else {
+              setUrlMessage(`🛑 Error response received! Got ${response.status} after ${requestCount} requests`);
+              addNotification(`Error ${response.status} at request #${requestCount}`, 'error');
+            }
             break;
           } else if (response.ok) {
             results.successfulRequests++;
             
-            // Store detected limits from first successful response
             if (requestCount === 1 && data.rateLimitInfo?.detected) {
               results.detectedLimits = data.rateLimitInfo.detected;
             }
             
             setUrlMessage(`🔄 Flood testing... ${requestCount} requests sent (${response.status})`);
-          } else {
-            results.errors.push({
-              requestNumber: requestCount,
-              status: response.status,
-              error: data.error || 'Unknown error'
-            });
           }
 
-          // Small delay between requests
           await new Promise(resolve => setTimeout(resolve, requestDelay));
 
         } catch (error) {
@@ -314,7 +356,6 @@ function App() {
             error: error.message
           });
           
-          // Continue on network errors
           setUrlMessage(`⚠️ Request ${requestCount} failed: ${error.message}. Continuing...`);
           await new Promise(resolve => setTimeout(resolve, requestDelay));
         }
@@ -323,24 +364,34 @@ function App() {
       results.endTime = Date.now();
       const totalTime = results.endTime - results.startTime;
 
-      // Final summary
+      // Enhanced final summary
       let summary = `🏁 Flood test completed!\n`;
+      
+      if (cancelFloodTestRef.current) {
+        summary = `🛑 Flood test cancelled!\n`;
+        results.cancelled = true;
+        addNotification('Flood test cancelled by user', 'info');
+      }
+      
       summary += `📊 Total requests: ${results.totalRequests}\n`;
       summary += `✅ Successful: ${results.successfulRequests}\n`;
       summary += `⏱️ Total time: ${(totalTime / 1000).toFixed(2)}s\n`;
       summary += `🔄 Avg rate: ${(results.totalRequests / (totalTime / 1000)).toFixed(1)} req/s\n`;
       
       if (results.rateLimitHit) {
-        summary += `🚫 Rate limit hit at request #${results.rateLimitAt}\n`;
+        summary += `🚫 Rate limit hit at request #${results.rateLimitAt} (429)\n`;
         if (results.detectedLimits?.limit) {
           summary += `🔍 Detected limit: ${results.detectedLimits.limit} req/${results.detectedLimits.window}s\n`;
         }
-      } else {
-        summary += `✅ No rate limit encountered (tested up to ${maxRequests} requests)\n`;
+      } else if (results.errorAt) {
+        summary += `🛑 Error response at request #${results.errorAt} (${results.errorStatus})\n`;
+        summary += `🔄 Testing stopped due to error response\n`;
+      } else if (!results.cancelled) {
+        summary += `✅ No errors encountered (tested up to ${maxRequests} requests)\n`;
       }
 
       if (results.errors.length > 0) {
-        summary += `❌ Errors: ${results.errors.length}\n`;
+        summary += `❌ Network errors: ${results.errors.length}\n`;
       }
 
       setUrlMessage(summary);
@@ -350,6 +401,7 @@ function App() {
       setUrlMessage(`❌ Flood test error: ${error.message}`);
     } finally {
       setIsFloodTesting(false);
+      cancelFloodTestRef.current = false;
     }
   };
 
@@ -383,11 +435,23 @@ function App() {
         message += `\n⏱️ Response time: ${data.responseTime}`;
         
         setCustomMessage(message);
+      } else if (response.status === 429) {
+        // Handle 429 with detected limits
+        let message = `🚫 ${customMethod} ${data.responseStatus}: ${data.message}`;
+        
+        if (data.detectedLimits) {
+          message += `\n🔍 Server's actual limits detected: ${data.detectedLimits.limit} req/${data.detectedLimits.window}s`;
+          message += `\n⚙️ Configured limits: ${data.customLimits.configured.limit} req/${data.customLimits.configured.window}s`;
+          message += `\n🎯 Using detected limits for future requests`;
+          addNotification(`Server rate limit detected: ${data.detectedLimits.limit} req/${data.detectedLimits.window}s`, 'info');
+        }
+        
+        message += `\n⏱️ Response time: ${data.responseTime}`;
+        setCustomMessage(message);
       } else {
         setCustomMessage(`❌ ${data.error}: ${data.message}`);
       }
     } catch (error) {
-      // Better error handling for parsing issues
       if (error.message.includes('Unexpected token')) {
         setCustomMessage(`❌ Server Error: Received invalid response format. Please check if the backend server is running properly.`);
       } else {
@@ -398,29 +462,169 @@ function App() {
     }
   };
 
-  // Get current custom endpoint status
-  const getCurrentCustomStatus = () => {
-    if (!customEndpoint) return { canRequest: false, reason: 'Endpoint required' };
+  // Flood test for custom endpoints
+  const floodTestCustom = async () => {
+    if (!customEndpoint) return;
     
-    const endpointInfo = customData.find(item => item.url === customEndpoint);
+    setIsCustomFloodTesting(true);
+    cancelCustomFloodTestRef.current = false;
+    setCustomMessage('');
+    setCustomFloodResults(null);
     
-    if (!endpointInfo) return { canRequest: true, reason: '' };
-    
-    if (endpointInfo.status === 'Blocked') {
-      return { 
-        canRequest: false, 
-        reason: `Blocked for ${endpointInfo.timeLeft}s` 
-      };
+    const results = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      rateLimitHit: false,
+      rateLimitAt: null,
+      errorAt: null,
+      errorStatus: null,
+      responses: [],
+      startTime: Date.now(),
+      endTime: null,
+      detectedLimits: null,
+      actualLimitsDetected: false,
+      errors: [],
+      cancelled: false
+    };
+
+    try {
+      let requestCount = 0;
+      let stopTesting = false;
+      const maxRequests = parseInt(customLimit) + 10;
+      const requestDelay = 100;
+
+      while (!stopTesting && requestCount < maxRequests && !cancelCustomFloodTestRef.current) {
+        requestCount++;
+        results.totalRequests = requestCount;
+
+        try {
+          const requestStart = Date.now();
+          const response = await fetch(`${API_BASE}/test-custom`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              url: customEndpoint,
+              method: customMethod,
+              limit: parseInt(customLimit),
+              window: parseInt(customWindow)
+            })
+          });
+          
+          const responseTime = Date.now() - requestStart;
+          const data = await response.json();
+          
+          const responseLog = {
+            requestNumber: requestCount,
+            status: response.status,
+            responseTime,
+            timestamp: new Date().toISOString(),
+            usage: `${requestCount}/${customLimit}`
+          };
+
+          results.responses.push(responseLog);
+
+          // Check for 4xx or 5xx responses
+          if (response.status >= 400) {
+            stopTesting = true;
+            results.errorAt = requestCount;
+            results.errorStatus = response.status;
+            
+            if (response.status === 429) {
+              results.rateLimitHit = true;
+              results.rateLimitAt = requestCount;
+              
+              if (data.detectedLimits && data.customLimits?.actual) {
+                results.actualLimitsDetected = true;
+                results.detectedLimits = data.customLimits.actual;
+                setCustomMessage(`🔍 Server rate limit detected! Got 429 after ${requestCount} requests\nActual server limit: ${data.detectedLimits.limit} req/${data.detectedLimits.window}s`);
+                addNotification(`Server limit detected: ${data.detectedLimits.limit} req/${data.detectedLimits.window}s (not ${customLimit}/${customWindow}s)`, 'error');
+              } else {
+                setCustomMessage(`🚫 Custom rate limit hit! Got 429 after ${requestCount} requests`);
+                addNotification(`Custom rate limit reached at request #${requestCount}`, 'error');
+              }
+            } else {
+              setCustomMessage(`🛑 Error response received! Got ${response.status} after ${requestCount} requests`);
+              addNotification(`Error ${response.status} at request #${requestCount}`, 'error');
+            }
+            break;
+          } else if (response.ok) {
+            results.successfulRequests++;
+            
+            if (requestCount === 1 && data.customLimits) {
+              results.detectedLimits = data.customLimits;
+            }
+            
+            setCustomMessage(`🔄 Flood testing... ${requestCount} requests sent (${response.status})`);
+          }
+
+          await new Promise(resolve => setTimeout(resolve, requestDelay));
+
+        } catch (error) {
+          results.errors.push({
+            requestNumber: requestCount,
+            error: error.message
+          });
+          
+          setCustomMessage(`⚠️ Request ${requestCount} failed: ${error.message}. Continuing...`);
+          await new Promise(resolve => setTimeout(resolve, requestDelay));
+        }
+      }
+
+      results.endTime = Date.now();
+      const totalTime = results.endTime - results.startTime;
+
+      // Enhanced final summary
+      let summary = `🏁 Custom flood test completed!\n`;
+      
+      if (cancelCustomFloodTestRef.current) {
+        summary = `🛑 Custom flood test cancelled!\n`;
+        results.cancelled = true;
+        addNotification('Custom flood test cancelled by user', 'info');
+      }
+      
+      summary += `📊 Total requests: ${results.totalRequests}\n`;
+      summary += `✅ Successful: ${results.successfulRequests}\n`;
+      summary += `⏱️ Total time: ${(totalTime / 1000).toFixed(2)}s\n`;
+      summary += `🔄 Avg rate: ${(results.totalRequests / (totalTime / 1000)).toFixed(1)} req/s\n`;
+      summary += `⚙️ Configured limit: ${customLimit} req/${customWindow}s\n`;
+      
+      if (results.actualLimitsDetected) {
+        summary += `🔍 Server's actual limit detected: ${results.detectedLimits?.limit} req/${results.detectedLimits?.window}s\n`;
+        summary += `⚠️ Server limit differs from configured limit!\n`;
+      } else if (results.rateLimitHit) {
+        summary += `🚫 Rate limit hit at request #${results.rateLimitAt} (429)\n`;
+      } else if (results.errorAt) {
+        summary += `🛑 Error response at request #${results.errorAt} (${results.errorStatus})\n`;
+      } else if (!results.cancelled) {
+        summary += `✅ No errors encountered (tested up to ${maxRequests} requests)\n`;
+      }
+
+      if (results.errors.length > 0) {
+        summary += `❌ Network errors: ${results.errors.length}\n`;
+      }
+
+      setCustomMessage(summary);
+      setCustomFloodResults(results);
+
+    } catch (error) {
+      setCustomMessage(`❌ Flood test error: ${error.message}`);
+    } finally {
+      setIsCustomFloodTesting(false);
+      cancelCustomFloodTestRef.current = false;
     }
-    
-    if (endpointInfo.requestCount >= endpointInfo.limits?.maxRequests) {
-      return { 
-        canRequest: false, 
-        reason: 'Rate limit reached' 
-      };
-    }
-    
-    return { canRequest: true, reason: '' };
+  };
+
+  // Cancel flood test functions
+  const cancelFloodTestUrl = () => {
+    cancelFloodTestRef.current = true;
+    addNotification('Cancelling flood test...', 'info');
+  };
+
+  const cancelCustomFloodTestFunc = () => {
+    cancelCustomFloodTestRef.current = true;
+    addNotification('Cancelling custom flood test...', 'info');
   };
 
   // Poll for data every 1 second for real-time cooldown updates
@@ -519,6 +723,7 @@ function App() {
             urlStatus={urlStatus}
             onTestUrl={testUrlRequest}
             onFloodTest={floodTestUrl}
+            onCancelFlood={cancelFloodTestUrl}
             urlMessage={urlMessage}
             floodResults={floodResults}
           />
@@ -538,6 +743,10 @@ function App() {
             customStatus={customStatus}
             onTestCustom={testCustomEndpoint}
             customMessage={customMessage}
+            isFloodTesting={isCustomFloodTesting}
+            onFloodTest={floodTestCustom}
+            onCancelFlood={cancelCustomFloodTestFunc}
+            floodResults={customFloodResults}
           />
         )}
 

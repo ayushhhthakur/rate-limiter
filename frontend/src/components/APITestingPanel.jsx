@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef } from 'react';
 
 const APITestingPanel = ({
   testUrl,
@@ -10,9 +10,31 @@ const APITestingPanel = ({
   urlStatus,
   onTestUrl,
   onFloodTest,
+  onCancelFlood,
   urlMessage,
   floodResults
 }) => {
+  const abortControllerRef = useRef(null);
+
+  const handleTestUrl = async () => {
+    if (!testUrl) return;
+    
+    abortControllerRef.current = new AbortController();
+    try {
+      await onTestUrl(abortControllerRef.current.signal);
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        // Request was canceled
+      }
+    }
+  };
+
+  const handleCancel = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+  };
+
   return (
     <div className="p-6">
       <h2 className="text-xl font-semibold mb-4">API Testing Test</h2>
@@ -61,7 +83,7 @@ const APITestingPanel = ({
         </div>
         <div className="flex items-center gap-4">
           <button
-            onClick={onTestUrl}
+            onClick={handleTestUrl}
             disabled={urlLoading || isFloodTesting || !urlStatus.canRequest}
             className={`px-6 py-2 rounded-md transition-colors ${
               urlLoading || isFloodTesting || !urlStatus.canRequest
@@ -72,17 +94,26 @@ const APITestingPanel = ({
             {urlLoading ? 'Testing...' : `${httpMethod} Single Test`}
           </button>
           
-          <button
-            onClick={onFloodTest}
-            disabled={urlLoading || isFloodTesting || !testUrl}
-            className={`px-6 py-2 rounded-md transition-colors ${
-              urlLoading || isFloodTesting || !testUrl
-                ? 'bg-gray-400 text-gray-600 cursor-not-allowed'
-                : 'bg-red-600 text-white hover:bg-red-700'
-            }`}
-          >
-            {isFloodTesting ? 'Flood Testing...' : '🌊 Flood Test'}
-          </button>
+          {!isFloodTesting ? (
+            <button
+              onClick={onFloodTest}
+              disabled={urlLoading || isFloodTesting || !testUrl}
+              className={`px-6 py-2 rounded-md transition-colors ${
+                urlLoading || isFloodTesting || !testUrl
+                  ? 'bg-gray-400 text-gray-600 cursor-not-allowed'
+                  : 'bg-red-600 text-white hover:bg-red-700'
+              }`}
+            >
+              🌊 Flood Test
+            </button>
+          ) : (
+            <button
+              onClick={onCancelFlood}
+              className="px-6 py-2 bg-orange-600 text-white rounded-md hover:bg-orange-700 transition-colors"
+            >
+              🛑 Cancel Flood Test
+            </button>
+          )}
           
           {(!urlStatus.canRequest || !testUrl) && (
             <p className="text-xs text-red-600">

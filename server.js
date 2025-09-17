@@ -14,6 +14,51 @@ const rateLimiter = new RateLimiter();
 const urlRateLimiter = new RateLimiter(); // For API Testing
 const customRateLimiter = new RateLimiter(); // For custom API rate limiting
 
+// Cumulative counters (do not reset with windows)
+const cumulativeCounts = { ip: 0, url: 0, custom: 0 };
+
+// Track last client IP per external URL / custom endpoint
+const lastClientForURL = new Map();
+const lastClientForCustom = new Map();
+
+// ipinfo caching
+const ipInfoCache = new Map();
+async function fetchIPInfo(ip) {
+  if (!ip || ip === 'localhost') {
+    return {
+      ip: 'localhost',
+      city: 'Local',
+      region: 'Local',
+      country: 'LOCAL',
+      org: 'Local Network',
+      source: 'local'
+    };
+  }
+  if (ipInfoCache.has(ip)) return ipInfoCache.get(ip);
+  const token = process.env.IPINFO_TOKEN; // optional
+  try {
+    const url = token ? `https://ipinfo.io/${ip}?token=${token}` : `https://ipinfo.io/${ip}`;
+    const resp = await fetch(url, { timeout: 5000 });
+    if (!resp.ok) throw new Error('ipinfo response not ok');
+    const data = await resp.json();
+    const simplified = {
+      ip: data.ip,
+      city: data.city,
+      region: data.region,
+      country: data.country,
+      org: data.org,
+      loc: data.loc,
+      source: 'ipinfo'
+    };
+    ipInfoCache.set(ip, simplified);
+    return simplified;
+  } catch {
+    const fallback = { ip, city: null, region: null, country: null, org: null, source: 'unresolved' };
+    ipInfoCache.set(ip, fallback);
+    return fallback;
+  }
+}
+
 // Normalize IP address
 function normalizeIP(ip) {
   if (!ip || ip === '::1' || ip === '127.0.0.1' || ip === '::ffff:127.0.0.1') {
@@ -40,7 +85,6 @@ function getClientIP(req) {
 function rateLimitMiddleware(req, res, next) {
   const clientIP = getClientIP(req);
   const result = rateLimiter.checkLimit(clientIP);
-  
   if (!result.allowed) {
     return res.status(429).json({
       error: 'Too Many Requests',
@@ -48,7 +92,7 @@ function rateLimitMiddleware(req, res, next) {
       timeLeft: result.timeLeft
     });
   }
-  
+  cumulativeCounts.ip++; // increment cumulative IP counter
   next();
 }
 
@@ -176,11 +220,13 @@ app.get('/', (req, res) => {
   });
 });
 
-app.get('/home', rateLimitMiddleware, (req, res) => {
+app.get('/home', rateLimitMiddleware, async (req, res) => {
   const clientIP = getClientIP(req);
+  const ipInfo = await fetchIPInfo(clientIP);
   res.json({
     message: 'Welcome to the home page!',
     ip: clientIP,
+    ipInfo,
     timestamp: new Date().toISOString(),
     requestUrl: req.originalUrl,
     nextRequest: `Try: http://localhost:${PORT}/home${req.query.ip ? `?ip=${req.query.ip}` : ''}`
@@ -199,6 +245,10 @@ app.get('/monitor', (req, res) => {
 
 app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
   const { url, method = 'GET' } = req.body;
+  const clientIP = getClientIP(req);
+  const clientIPInfo = await fetchIPInfo(clientIP);
+  cumulativeCounts.url++; // increment cumulative URL counter
+  lastClientForURL.set(url, { clientIP, clientIPInfo, lastAt: Date.now() });
   
   try {
     // Make actual request to the URL to detect rate limits
@@ -244,14 +294,13 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
       if (contentType && contentType.includes('application/json')) {
         responseData = await response.json();
       }
-    } catch (e) {
-      // Ignore JSON parse errors
-    }
-    
-    res.json({
+    } catch {}
+    return res.json({
       message: limitResult.allowed ? 'URL request successful!' : 'Rate limit detected and applied',
-      url: url,
+      url,
       method: method.toUpperCase(),
+      clientIP,
+      clientIPInfo,
       timestamp: new Date().toISOString(),
       responseStatus: response.status,
       responseTime: `${responseTime}ms`,
@@ -259,9 +308,9 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
         detected: rateLimitInfo,
         applied: {
           limit: rateLimitInfo.limit || 60,
-          window: rateLimitInfo.window || 3600,
-          remaining: rateLimitInfo.remaining,
-          resetTime: rateLimitInfo.resetTime
+            window: rateLimitInfo.window || 3600,
+            remaining: rateLimitInfo.remaining,
+            resetTime: rateLimitInfo.resetTime
         }
       },
       currentUsage: {
@@ -269,28 +318,28 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
         allowed: limitResult.allowed
       },
       responseHeaders: Object.fromEntries(
-        Array.from(response.headers.entries()).filter(([key]) => 
-          key.toLowerCase().includes('ratelimit') || 
-          key.toLowerCase().includes('rate-limit') || 
+        Array.from(response.headers.entries()).filter(([key]) =>
+          key.toLowerCase().includes('ratelimit') ||
+          key.toLowerCase().includes('rate-limit') ||
           key.toLowerCase().includes('retry-after') ||
           key.toLowerCase().includes('x-ratelimit')
         )
       )
     });
   } catch (error) {
-    // Still count as a rate limit test even if URL fails
-    urlRateLimiter.setCustomLimits(url, 60, 3600000); // Default fallback
+    urlRateLimiter.setCustomLimits(url, 60, 3600000);
     const limitResult = urlRateLimiter.checkLimit(url);
-    
-    res.json({
+    return res.json({
       message: 'Rate limit test completed (URL may be unreachable)',
-      url: url,
+      url,
       method: method.toUpperCase(),
+      clientIP,
+      clientIPInfo,
       timestamp: new Date().toISOString(),
       error: error.message,
       rateLimitInfo: {
         detected: { limit: null, window: null, source: 'failed_request', error: error.message },
-        applied: { limit: 60, window: 3600 } // Default fallback
+        applied: { limit: 60, window: 3600 }
       },
       currentUsage: {
         requestCount: limitResult.currentRequests,
@@ -302,6 +351,10 @@ app.post('/test-url', urlRateLimitMiddleware, async (req, res) => {
 
 app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
   const { url, method = 'GET', limit = 10, window = 60 } = req.body;
+  const clientIP = getClientIP(req);
+  const clientIPInfo = await fetchIPInfo(clientIP);
+  cumulativeCounts.custom++; // increment cumulative custom counter
+  lastClientForCustom.set(url, { clientIP, clientIPInfo, lastAt: Date.now() });
   
   try {
     // Make actual request to the URL
@@ -333,10 +386,12 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
     // Now check the rate limit after making the request
     const limitResult = customRateLimiter.checkLimit(url);
     
-    res.json({
+    return res.json({
       message: 'Custom endpoint test successful!',
-      url: url,
+      url,
       method: method.toUpperCase(),
+      clientIP,
+      clientIPInfo,
       timestamp: new Date().toISOString(),
       responseStatus: response.status,
       responseTime: `${responseTime}ms`,
@@ -352,13 +407,13 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
       }
     });
   } catch (error) {
-    // Still count as a rate limit test even if URL fails
     const limitResult = customRateLimiter.checkLimit(url);
-    
-    res.json({
+    return res.json({
       message: 'Custom endpoint test completed (URL may be unreachable)',
-      url: url,
+      url,
       method: method.toUpperCase(),
+      clientIP,
+      clientIPInfo,
       timestamp: new Date().toISOString(),
       error: error.message,
       customLimits: {
@@ -375,33 +430,113 @@ app.post('/test-custom', customRateLimitMiddleware, async (req, res) => {
   }
 });
 
-app.get('/monitor-urls', (req, res) => {
-  const data = urlRateLimiter.getAllIPs(); // Reusing same method, but for URLs
+app.get('/monitor-urls', async (req, res) => {
+  const data = urlRateLimiter.getAllIPs();
+  const enriched = await Promise.all(
+    data.map(async item => {
+      const urlKey = item.ip;
+      const meta = lastClientForURL.get(urlKey);
+      const clientIP = meta?.clientIP;
+      const clientIPInfo = meta?.clientIPInfo;
+      return {
+        ...item,
+        url: urlKey,
+        ip: undefined,
+        lastRequest: item.lastRequest || null,
+        clientIP: clientIP || null,
+        clientIPInfo: clientIPInfo || null
+      };
+    })
+  );
   res.json({
     endpoint: `/monitor-urls`,
-    totalTrackedUrls: data.length,
-    data: data.map(item => ({
-      ...item,
-      url: item.ip, // ip field contains URL
-      ip: undefined, // Remove ip field for clarity
-      lastRequest: item.lastRequest || null
-    })).filter(item => item.url), // Only return items with URLs
+    totalTrackedUrls: enriched.length,
+    data: enriched.filter(i => i.url),
     refreshUrl: `http://localhost:${PORT}/monitor-urls`
   });
 });
 
-app.get('/monitor-custom', (req, res) => {
-  const data = customRateLimiter.getAllIPs(); // Reusing same method, but for custom endpoints
+app.get('/monitor-custom', async (req, res) => {
+  const data = customRateLimiter.getAllIPs();
+  const enriched = await Promise.all(
+    data.map(async item => {
+      const urlKey = item.ip;
+      const meta = lastClientForCustom.get(urlKey);
+      return {
+        ...item,
+        url: urlKey,
+        ip: undefined,
+        lastRequest: item.lastRequest || null,
+        clientIP: meta?.clientIP || null,
+        clientIPInfo: meta?.clientIPInfo || null
+      };
+    })
+  );
   res.json({
     endpoint: `/monitor-custom`,
-    totalTrackedEndpoints: data.length,
-    data: data.map(item => ({
-      ...item,
-      url: item.ip, // ip field contains URL
-      ip: undefined, // Remove ip field for clarity
-      lastRequest: item.lastRequest || null
-    })).filter(item => item.url), // Only return items with URLs
+    totalTrackedEndpoints: enriched.length,
+    data: enriched.filter(i => i.url),
     refreshUrl: `http://localhost:${PORT}/monitor-custom`
+  });
+});
+
+// Clear all data endpoint
+app.post('/clear-data', (req, res) => {
+  try {
+    rateLimiter.storage.clear();
+    urlRateLimiter.storage.clear();
+    customRateLimiter.storage.clear();
+    
+    // Reset cumulative counters
+    cumulativeCounts.ip = 0;
+    cumulativeCounts.url = 0;
+    cumulativeCounts.custom = 0;
+    
+    // Clear client tracking maps
+    lastClientForURL.clear();
+    lastClientForCustom.clear();
+    
+    res.json({
+      message: 'All rate limiter data cleared successfully',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to clear data'
+    });
+  }
+});
+
+// Analytics endpoint
+app.get('/analytics', (req, res) => {
+  const urlData = urlRateLimiter.getAllIPs();
+  const customData = customRateLimiter.getAllIPs();
+  const analytics = {
+    totalUrls: urlData.length,
+    totalCustomEndpoints: customData.length,
+    blockedUrls: urlData.filter(item => item.status === 'Blocked').length,
+    blockedCustom: customData.filter(item => item.status === 'Blocked').length,
+    // Use cumulative counts instead of window-based snapshot
+    totalRequests: cumulativeCounts.ip + cumulativeCounts.url + cumulativeCounts.custom,
+    breakdown: {
+      ip: cumulativeCounts.ip,
+      url: cumulativeCounts.url,
+      custom: cumulativeCounts.custom
+    },
+    detectedLimits: urlData.filter(item => item.limits?.source === 'detected').length,
+    timestamp: new Date().toISOString()
+  };
+  res.json(analytics);
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
   });
 });
 
